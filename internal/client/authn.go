@@ -11,6 +11,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/go-jose/go-jose/v4"
@@ -18,6 +19,7 @@ import (
 	"github.com/luikyv/go-oidc/internal/oidc"
 	"github.com/luikyv/go-oidc/internal/timeutil"
 	"github.com/luikyv/go-oidc/pkg/goidc"
+	"golang.org/x/crypto/bcrypt"
 )
 
 const (
@@ -120,11 +122,49 @@ func authenticateSecretBasic(ctx oidc.Context, c *goidc.Client) error {
 	return validateSecret(c, secret)
 }
 
+// validateSecret compares the presented client secret against the stored
+// c.Secret value. Upstream v0.17 uses subtle.ConstantTimeCompare, which
+// requires c.Secret to hold plaintext. This fork detects bcrypt hashes by
+// the canonical $2x$ prefix plus 60-char length and dispatches to
+// bcrypt.CompareHashAndPassword; otherwise it falls through to the
+// plaintext constant-time compare for legacy / DCR-generated secrets. See
+// forks/go-oidc/PATCHES.md.
+//
+// Pathological edge case: a plaintext secret that happens to be exactly 60
+// characters and begins with "$2a$"/"$2b$"/"$2x$"/"$2y$" will be routed to
+// bcrypt.CompareHashAndPassword, which will return an error for a
+// non-genuine hash and cause correct authentication to fail. This is not
+// exploitable (it only locks the legitimate client out) and does not occur
+// with secrets minted by butter's SetSecret or DCR random-string
+// generation. Try-then-fall-through is NOT used as a mitigation because it
+// introduces a DB-dump replay attack: an attacker who reads the hash from
+// DynamoDB could submit the raw hash string as the "plaintext" and pass
+// the fallback constant-time compare.
 func validateSecret(c *goidc.Client, secret string) error {
+	if looksLikeBcryptHash(c.Secret) {
+		if err := bcrypt.CompareHashAndPassword([]byte(c.Secret), []byte(secret)); err != nil {
+			return goidc.NewError(goidc.ErrorCodeInvalidClient, "invalid client secret")
+		}
+		return nil
+	}
 	if subtle.ConstantTimeCompare([]byte(c.Secret), []byte(secret)) != 1 {
 		return goidc.NewError(goidc.ErrorCodeInvalidClient, "invalid client secret")
 	}
 	return nil
+}
+
+// looksLikeBcryptHash returns true when s carries the canonical bcrypt
+// wire format ($2a$/$2b$/$2x$/$2y$ prefix, 60 chars total). Mirrored in
+// butter/internal/clients/client.go#isBcryptHash — keep the two in sync
+// (they live in separate modules across the fork boundary).
+func looksLikeBcryptHash(s string) bool {
+	if len(s) != 60 {
+		return false
+	}
+	return strings.HasPrefix(s, "$2a$") ||
+		strings.HasPrefix(s, "$2b$") ||
+		strings.HasPrefix(s, "$2x$") ||
+		strings.HasPrefix(s, "$2y$")
 }
 
 func authenticatePrivateKeyJWT(ctx oidc.Context, c *goidc.Client, authnCtx AuthnContext) error {
